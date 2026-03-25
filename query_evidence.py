@@ -1,109 +1,112 @@
 import pandas as pd
-import wikipedia
+import sqlite3
 import re
-import time
-from rank_bm25 import BM25Okapi
+import torch
+from sentence_transformers import SentenceTransformer, util
 from typing import List
+from tqdm import tqdm
 
 # ====================== CONFIG ======================
-INPUT_CSV = "processed_fakenews_data.csv"   # <-- ĐỔI TÊN FILE CỦA BẠN Ở ĐÂY
+INPUT_CSV = "processed_fakenews_data.csv"
 OUTPUT_CSV = "evidence_retrieved.csv"
-TOP_K_EVIDENCE = 5                            # Số evidence tốt nhất lấy về cho mỗi claim
-WIKI_LANGUAGE = "en"                          # FakeNewsNet là tiếng Anh
+DB_NAME = "local_wikipedia.db"
+TOP_K_EVIDENCE = 5
+MODEL_NAME = 'all-MiniLM-L6-v2'
 # ===================================================
 
 def parse_entities(entities_str: str) -> List[str]:
-    """Parse chuỗi entities từ CSV thành list"""
-    if not entities_str or entities_str.strip() == "[]" or entities_str.strip() == "":
+    if not entities_str or pd.isna(entities_str) or str(entities_str).strip() in ["[]", ""]:
         return []
-    # Xóa dấu [] và split theo dấu phẩy
-    cleaned = entities_str.strip("[]")
+    cleaned = str(entities_str).strip("[]")
     return [e.strip() for e in cleaned.split(",") if e.strip()]
 
 def split_sentences(text: str) -> List[str]:
-    """Tách thành câu đơn giản và sạch"""
-    # Regex tốt cho tiếng Anh
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if len(s.strip()) > 15]  # loại câu quá ngắn
+    return [s.strip() for s in sentences if len(s.strip()) > 15]
 
-def get_wikipedia_evidence(claim: str, entities: List[str]) -> List[str]:
-    """Lấy evidence từ Wikipedia + BM25"""
+def get_local_evidence(claim: str, entities: List[str], model: SentenceTransformer, cursor: sqlite3.Cursor) -> List[str]:
+    """Fetches text instantly from local DB, then uses GPU Semantic Search"""
     documents = []
-    wikipedia.set_lang(WIKI_LANGUAGE)
 
-    # 1. Lấy trang của từng entity (ưu tiên)
+    # 1. Local Database Lookup (Instant)
     for entity in entities:
-        try:
-            page = wikipedia.page(entity, auto_suggest=True)
-            documents.append(page.content)          # content = toàn bộ bài viết (không markup)
-            time.sleep(0.5)                         # tránh rate limit
-        except (wikipedia.exceptions.PageError, wikipedia.exceptions.DisambiguationError):
-            pass
-        except Exception:
-            pass
-
-    # 2. Search theo claim để bổ sung thêm trang liên quan
-    try:
-        search_results = wikipedia.search(claim, results=3)
-        for title in search_results:
-            try:
-                page = wikipedia.page(title, auto_suggest=True)
-                documents.append(page.content)
-                time.sleep(0.5)
-            except Exception:
-                pass
-    except Exception:
-        pass
+        # Try exact match first
+        cursor.execute("SELECT text FROM wiki WHERE title = ? COLLATE NOCASE", (entity,))
+        row = cursor.fetchone() # Just grab the best match
+        
+        if row:
+            # Keep only the first 5000 characters to prevent GPU bottlenecking
+            documents.append(row[0][:5000])
+        else:
+            # Fallback: "Starts with" search (This uses the index and is INSTANT)
+            cursor.execute("SELECT text FROM wiki WHERE title LIKE ? COLLATE NOCASE LIMIT 1", (f"{entity}%",))
+            row = cursor.fetchone()
+            if row:
+                documents.append(row[0][:5000])
 
     if not documents:
-        return ["No evidence found from Wikipedia."]
+        return ["No evidence found in local Wikipedia."]
 
-    # Ghép tất cả nội dung lại và tách thành câu
     full_text = " ".join(documents)
     corpus = split_sentences(full_text)
+    
+    # Hard cap at 200 sentences to ensure GPU runs at lightning speed
+    corpus = corpus[:200]
 
     if len(corpus) == 0:
-        return ["No evidence found from Wikipedia."]
+        return ["No evidence found in local Wikipedia."]
 
-    # BM25 Retrieval
-    tokenized_corpus = [doc.split() for doc in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
-    tokenized_query = claim.lower().split()
+    # 2. GPU Accelerated Retrieval
+    # PyTorch processes this batch instantly now
+    corpus_embeddings = model.encode(corpus, convert_to_tensor=True)
+    query_embedding = model.encode(claim, convert_to_tensor=True)
 
-    scores = bm25.get_scores(tokenized_query)
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:TOP_K_EVIDENCE]
+    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
     
-    top_evidence = [corpus[i] for i in top_indices]
-    return top_evidence
+    top_k = min(TOP_K_EVIDENCE, len(corpus))
+    top_results = torch.topk(cosine_scores, k=top_k)
+    
+    top_indices = top_results.indices.tolist()
+    return [corpus[i] for i in top_indices]
 
 # ====================== MAIN ======================
 if __name__ == "__main__":
-    print("Đang load dữ liệu từ preprocessing...")
-    df = pd.read_csv(INPUT_CSV)
+    # 1. Initialize GPU Model
+    if torch.cuda.is_available():
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        print(f"🚀 Initializing model on GPU: {gpu_name}")
+    else:
+        device = "cpu"
+        print("⚠️ No GPU detected. Using CPU.")
     
-    print(f"Đang xử lý {len(df)} claims...")
+    retriever_model = SentenceTransformer(MODEL_NAME, device=device)
+
+    # 2. Connect to Local Database
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+    except sqlite3.OperationalError:
+        print(f"❌ Error: Could not find {DB_NAME}. Did you run the builder script first?")
+        exit()
+
+    # 3. Load Data
+    print("📂 Loading data from preprocessing...")
+    df = pd.read_csv(INPUT_CSV)
     evidence_list = []
     
-    for idx, row in df.iterrows():
-        claim = row['claim']
-        entities_str = str(row['entities'])
-        entities = parse_entities(entities_str)
+    # 4. Process Loop with Progress Bar
+    print(f"⚙️ Processing {len(df)} claims locally...")
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Fact Checking"):
+        claim = str(row['claim'])
+        entities = parse_entities(row.get('entities', ""))
         
-        print(f"[{idx+1}/{len(df)}] Processing: {claim[:80]}...")
+        evidence = get_local_evidence(claim, entities, retriever_model, cursor)
+        evidence_list.append(" ||| ".join(evidence))
         
-        evidence = get_wikipedia_evidence(claim, entities)
-        
-        # Ghép thành string để lưu CSV
-        evidence_str = " ||| ".join(evidence)
-        evidence_list.append(evidence_str)
-        
-        # Nghỉ 1 giây để tránh bị Wikipedia block
-        time.sleep(1)
-    
+    # 5. Save Results
     df['evidence'] = evidence_list
-    
-    # Xuất file theo đúng yêu cầu (claim, evidence, label) + các cột khác để tiện debug
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Hoàn thành! File output: {OUTPUT_CSV}")
-    print(f"   - Cột mới: 'evidence' (top {TOP_K_EVIDENCE} câu tốt nhất)")
-    print(f"   - Định dạng cho Verification Model: claim | evidence | label")
+    conn.close()
+    
+    print(f"\n✅ Pipeline Complete! File output: {OUTPUT_CSV}")
