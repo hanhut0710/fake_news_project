@@ -2,108 +2,123 @@ import pandas as pd
 import wikipedia
 import re
 import time
-from rank_bm25 import BM25Okapi
+import torch
+from sentence_transformers import SentenceTransformer, util
 from typing import List
+import concurrent.futures
+from tqdm import tqdm
 
 # ====================== CONFIG ======================
-INPUT_CSV = "processed_fakenews_data.csv"   # <-- ĐỔI TÊN FILE CỦA BẠN Ở ĐÂY
-OUTPUT_CSV = "evidence_retrieved.csv"
-TOP_K_EVIDENCE = 5                            # Số evidence tốt nhất lấy về cho mỗi claim
-WIKI_LANGUAGE = "en"                          # FakeNewsNet là tiếng Anh
+INPUT_CSV = "processed_fakenews_data.csv"
+OUTPUT_CSV = "evidence_retrieved_live.csv"
+TOP_K_EVIDENCE = 5
+WIKI_LANGUAGE = "en"
+MODEL_NAME = 'all-MiniLM-L6-v2'
+
+# THE SPEED LIMITER: 15 is fast, but safe enough to avoid IP bans
+MAX_WORKERS = 15 
 # ===================================================
 
 def parse_entities(entities_str: str) -> List[str]:
-    """Parse chuỗi entities từ CSV thành list"""
-    if not entities_str or entities_str.strip() == "[]" or entities_str.strip() == "":
+    if not entities_str or pd.isna(entities_str) or str(entities_str).strip() in ["[]", ""]:
         return []
-    # Xóa dấu [] và split theo dấu phẩy
-    cleaned = entities_str.strip("[]")
+    cleaned = str(entities_str).strip("[]")
     return [e.strip() for e in cleaned.split(",") if e.strip()]
 
 def split_sentences(text: str) -> List[str]:
-    """Tách thành câu đơn giản và sạch"""
-    # Regex tốt cho tiếng Anh
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if len(s.strip()) > 15]  # loại câu quá ngắn
+    return [s.strip() for s in sentences if len(s.strip()) > 15]
 
-def get_wikipedia_evidence(claim: str, entities: List[str]) -> List[str]:
-    """Lấy evidence từ Wikipedia + BM25"""
+def fetch_and_evaluate(row_data):
+    """This function is run by multiple workers simultaneously"""
+    idx, claim, entities, model = row_data
     documents = []
     wikipedia.set_lang(WIKI_LANGUAGE)
 
-    # 1. Lấy trang của từng entity (ưu tiên)
+    # 1. Ping Wikipedia (Network Bound)
     for entity in entities:
         try:
+            # Added a tiny sleep to space out requests slightly within the thread
+            time.sleep(0.1) 
             page = wikipedia.page(entity, auto_suggest=True)
-            documents.append(page.content)          # content = toàn bộ bài viết (không markup)
-            time.sleep(0.5)                         # tránh rate limit
-        except (wikipedia.exceptions.PageError, wikipedia.exceptions.DisambiguationError):
-            pass
+            documents.append(page.content[:5000]) # Cap at 5000 chars to save memory
         except Exception:
             pass
 
-    # 2. Search theo claim để bổ sung thêm trang liên quan
-    try:
-        search_results = wikipedia.search(claim, results=3)
-        for title in search_results:
-            try:
-                page = wikipedia.page(title, auto_suggest=True)
-                documents.append(page.content)
-                time.sleep(0.5)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Fallback search if entities fail
+    if not documents:
+        try:
+            search_results = wikipedia.search(claim, results=2)
+            for title in search_results:
+                try:
+                    time.sleep(0.1)
+                    page = wikipedia.page(title, auto_suggest=True)
+                    documents.append(page.content[:5000])
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     if not documents:
-        return ["No evidence found from Wikipedia."]
+        return idx, "No evidence found from Wikipedia."
 
-    # Ghép tất cả nội dung lại và tách thành câu
     full_text = " ".join(documents)
-    corpus = split_sentences(full_text)
+    corpus = split_sentences(full_text)[:200] # Cap sentences for GPU speed
 
     if len(corpus) == 0:
-        return ["No evidence found from Wikipedia."]
+        return idx, "No evidence found from Wikipedia."
 
-    # BM25 Retrieval
-    tokenized_corpus = [doc.split() for doc in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
-    tokenized_query = claim.lower().split()
+    # 2. GPU Semantic Search (Compute Bound)
+    corpus_embeddings = model.encode(corpus, convert_to_tensor=True)
+    query_embedding = model.encode(claim, convert_to_tensor=True)
 
-    scores = bm25.get_scores(tokenized_query)
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:TOP_K_EVIDENCE]
+    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
     
+    top_k = min(TOP_K_EVIDENCE, len(corpus))
+    top_results = torch.topk(cosine_scores, k=top_k)
+    
+    top_indices = top_results.indices.tolist()
     top_evidence = [corpus[i] for i in top_indices]
-    return top_evidence
+    
+    return idx, " ||| ".join(top_evidence)
 
 # ====================== MAIN ======================
 if __name__ == "__main__":
-    print("Đang load dữ liệu từ preprocessing...")
+    if torch.cuda.is_available():
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        print(f"🚀 Initializing model on GPU: {gpu_name}")
+    else:
+        device = "cpu"
+        print("⚠️ No GPU detected. Using CPU.")
+    
+    retriever_model = SentenceTransformer(MODEL_NAME, device=device)
+
+    print("📂 Loading data...")
     df = pd.read_csv(INPUT_CSV)
     
-    print(f"Đang xử lý {len(df)} claims...")
-    evidence_list = []
+    # Pre-allocate a list to keep results in the exact same order as the CSV
+    evidence_results = [""] * len(df)
     
+    # Package the data for the workers
+    tasks = []
     for idx, row in df.iterrows():
-        claim = row['claim']
-        entities_str = str(row['entities'])
-        entities = parse_entities(entities_str)
-        
-        print(f"[{idx+1}/{len(df)}] Processing: {claim[:80]}...")
-        
-        evidence = get_wikipedia_evidence(claim, entities)
-        
-        # Ghép thành string để lưu CSV
-        evidence_str = " ||| ".join(evidence)
-        evidence_list.append(evidence_str)
-        
-        # Nghỉ 1 giây để tránh bị Wikipedia block
-        time.sleep(1)
+        claim = str(row['claim'])
+        entities = parse_entities(row.get('entities', ""))
+        tasks.append((idx, claim, entities, retriever_model))
+
+    print(f"🌐 Pinging Wikipedia with {MAX_WORKERS} concurrent threads...")
     
-    df['evidence'] = evidence_list
-    
-    # Xuất file theo đúng yêu cầu (claim, evidence, label) + các cột khác để tiện debug
+    # Launch the Thread Pool
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # executor.map automatically assigns tasks to free workers
+        futures = executor.map(fetch_and_evaluate, tasks)
+        
+        # Wrap the output in tqdm for a live progress bar
+        for idx, evidence_str in tqdm(futures, total=len(df), desc="Retrieving Evidence"):
+            evidence_results[idx] = evidence_str
+            
+    df['evidence'] = evidence_results
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Hoàn thành! File output: {OUTPUT_CSV}")
-    print(f"   - Cột mới: 'evidence' (top {TOP_K_EVIDENCE} câu tốt nhất)")
-    print(f"   - Định dạng cho Verification Model: claim | evidence | label")
+    
+    print(f"\n✅ Live Scraping Complete! File output: {OUTPUT_CSV}")
