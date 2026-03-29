@@ -15,8 +15,11 @@ TOP_K_EVIDENCE = 5
 WIKI_LANGUAGE = "en"
 MODEL_NAME = 'all-MiniLM-L6-v2'
 
-# THE SPEED LIMITER: 15 is fast, but safe enough to avoid IP bans
-MAX_WORKERS = 15 
+# THE SPEED LIMITER: Reduced to 3 to avoid Wikipedia rate limiting
+# Wikipedia blocks around 10 concurrent requests, so 3 is safe
+MAX_WORKERS = 15
+RETRY_ATTEMPTS = 2
+BACKOFF_FACTOR = 1  # seconds to wait between retries
 # ===================================================
 
 def parse_entities(entities_str: str) -> List[str]:
@@ -39,6 +42,13 @@ def parse_entities(entities_str: str) -> List[str]:
     
     return split_entities
 
+def is_valid_entity(e):
+    return (
+        len(e) > 3 and
+        not e.islower() and
+        not e.isdigit()
+    )
+    
 def split_sentences(text: str) -> List[str]:
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if len(s.strip()) > 15]
@@ -49,35 +59,65 @@ def fetch_and_evaluate(row_data):
     documents = []
     wikipedia.set_lang(WIKI_LANGUAGE)
 
-    # 1. Ping Wikipedia (Network Bound)
+    # 1. Ping Wikipedia (Network Bound) - Try each entity individually
     for entity in entities:
-        try:
-            # Added a tiny sleep to space out requests slightly within the thread
-            time.sleep(0.1) 
-            page = wikipedia.page(entity, auto_suggest=True)
-            documents.append(page.content[:5000]) # Cap at 5000 chars to save memory
-        except Exception:
-            pass
-
-    # Fallback search if entities fail
-    if not documents:
-        try:
-            search_results = wikipedia.search(claim, results=2)
-            for title in search_results:
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                # Increased sleep between requests to reduce rate limiting
+                time.sleep(0.5)
+                results = wikipedia.search(entity, results=1)
+                if results:
+                    page = wikipedia.page(results[0], auto_suggest=False)
+                documents.append(page.content[:5000])  # Cap at 5000 chars to save memory
+                break  # Success, move to next entity
+            except wikipedia.exceptions.DisambiguationError as e:
+                # Pick the first option from disambiguation
                 try:
-                    time.sleep(0.1)
-                    page = wikipedia.page(title, auto_suggest=True)
+                    time.sleep(0.5)
+                    first_option = e.options[0] if e.options else entity
+                    page = wikipedia.page(first_option, auto_suggest=False)
                     documents.append(page.content[:5000])
-                except Exception:
+                    break
+                except Exception as e2:
+                    if attempt == RETRY_ATTEMPTS - 1:
+                        pass  # Skip this entity
+            except wikipedia.exceptions.PageError:
+                if attempt == RETRY_ATTEMPTS - 1:
+                    pass  # Entity doesn't exist, skip
+            except Exception as e:
+                # Rate limiting or network error
+                if attempt < RETRY_ATTEMPTS - 1:
+                    time.sleep(BACKOFF_FACTOR * (2 ** attempt))  # Exponential backoff
+                else:
+                    pass  # Give up on this entity
+
+    # Fallback search if entities fail (search for claim keywords)
+    if not documents:
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                time.sleep(0.5)
+                search_results = wikipedia.search(claim, results=3)
+                for title in search_results:
+                    try:
+                        time.sleep(0.5)
+                        page = wikipedia.page(title, auto_suggest=True)
+                        documents.append(page.content[:5000])
+                        break  # Got one document, stop searching
+                    except Exception:
+                        pass
+                if documents:
+                    break
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1:
+                    time.sleep(BACKOFF_FACTOR * (2 ** attempt))
+                else:
                     pass
-        except Exception:
-            pass
 
     if not documents:
         return idx, "No evidence found from Wikipedia."
 
     full_text = " ".join(documents)
-    corpus = split_sentences(full_text)[:200] # Cap sentences for GPU speed
+    corpus = split_sentences(full_text)[:200]  # Cap sentences for GPU speed
 
     if len(corpus) == 0:
         return idx, "No evidence found from Wikipedia."
@@ -120,10 +160,18 @@ if __name__ == "__main__":
     for idx, row in df.iterrows():
         claim = str(row['claim'])
         entities = parse_entities(row.get('entities', ""))
-        split_entities_results[idx] = str(entities)  # Store split entities
+         # 🔥 LỌC ENTITY Ở ĐÂY
+        entities = [e for e in entities if is_valid_entity(e)]
+        
+        # 🔥 GIỚI HẠN SỐ LƯỢNG (rất quan trọng)
+        entities = list(set(entities))[:3]
+        
+        split_entities_results[idx] = str(entities)
+        
         tasks.append((idx, claim, entities, retriever_model))
 
     print(f"🌐 Pinging Wikipedia with {MAX_WORKERS} concurrent threads...")
+    print(f"⏱️  Expecting ~{len(df) * 0.5 // 60:.0f}-{len(df) * 0.5 // 60 + 30:.0f} minutes (including retry logic)...\n")
     
     # Launch the Thread Pool
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -133,9 +181,18 @@ if __name__ == "__main__":
         # Wrap the output in tqdm for a live progress bar
         for idx, evidence_str in tqdm(futures, total=len(df), desc="Retrieving Evidence"):
             evidence_results[idx] = evidence_str
+
             
     df['entities'] = split_entities_results  # Update entities with split version
     df['evidence'] = evidence_results
     df.to_csv(OUTPUT_CSV, index=False)
     
+    # Print summary
+    found_count = sum(1 for e in evidence_results if e != "No evidence found from Wikipedia.")
     print(f"\n✅ Live Scraping Complete! File output: {OUTPUT_CSV}")
+    print(f"📊 Summary: {found_count}/{len(df)} records have evidence ({found_count/len(df)*100:.1f}%)")
+    if found_count / len(df) < 0.5:
+        print("⚠️  Low evidence retrieval rate. Consider:")
+        print("   - Increasing RETRY_ATTEMPTS in config")
+        print("   - Increasing sleep durations between requests")
+        print("   - Reducing MAX_WORKERS further")
