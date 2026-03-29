@@ -22,8 +22,22 @@ MAX_WORKERS = 15
 def parse_entities(entities_str: str) -> List[str]:
     if not entities_str or pd.isna(entities_str) or str(entities_str).strip() in ["[]", ""]:
         return []
+    
+    # Xử lý chuỗi list từ CSV (cả hai dạng bạn đưa ra đều được)
     cleaned = str(entities_str).strip("[]")
-    return [e.strip() for e in cleaned.split(",") if e.strip()]
+    entities = [e.strip().strip("'\"") for e in cleaned.split(",") if e.strip()]
+    
+    # Tách các thực thể ghép với '&' hoặc 'and'
+    split_entities = []
+    for entity in entities:
+        entity = entity.replace('"', '')
+
+        # Split theo & hoặc and (case-insensitive)
+        parts = re.split(r'\s*&\s*|\s+and\s+', entity, flags=re.IGNORECASE)
+        
+        split_entities.extend([p.strip() for p in parts if p.strip()])
+    
+    return split_entities
 
 def split_sentences(text: str) -> List[str]:
     sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -97,14 +111,16 @@ if __name__ == "__main__":
     print("📂 Loading data...")
     df = pd.read_csv(INPUT_CSV)
     
-    # Pre-allocate a list to keep results in the exact same order as the CSV
+    # Pre-allocate lists to keep results in the exact same order as the CSV
     evidence_results = [""] * len(df)
+    split_entities_results = [""] * len(df)
     
     # Package the data for the workers
     tasks = []
     for idx, row in df.iterrows():
         claim = str(row['claim'])
         entities = parse_entities(row.get('entities', ""))
+        split_entities_results[idx] = str(entities)  # Store split entities
         tasks.append((idx, claim, entities, retriever_model))
 
     print(f"🌐 Pinging Wikipedia with {MAX_WORKERS} concurrent threads...")
@@ -118,6 +134,7 @@ if __name__ == "__main__":
         for idx, evidence_str in tqdm(futures, total=len(df), desc="Retrieving Evidence"):
             evidence_results[idx] = evidence_str
             
+    df['entities'] = split_entities_results  # Update entities with split version
     df['evidence'] = evidence_results
     df.to_csv(OUTPUT_CSV, index=False)
     

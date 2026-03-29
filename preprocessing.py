@@ -1,10 +1,28 @@
 import pandas as pd
 import spacy
+import re
 import ast
 
 # 1. Load mô hình ngôn ngữ của spaCy
 print("Đang tải mô hình spaCy...")
 nlp = spacy.load("en_core_web_sm")
+
+def split_combined_entities(entities_list):
+    """
+    Tách entity dạng: A & B, A and B, A&B,...
+    """
+    split_entities = []
+    
+    for entity in entities_list:
+        # Xóa dấu ngoặc kép
+        entity = entity.replace('"', '')  # giữ lại dấu '
+        
+        # Split bằng regex (xử lý mọi case)
+        parts = re.split(r'\s*&\s*|\s+and\s+', entity, flags=re.IGNORECASE)
+        
+        split_entities.extend([p.strip() for p in parts if p.strip()])
+    
+    return split_entities
 
 def extract_entities(text):
     if not isinstance(text, str):
@@ -19,7 +37,10 @@ def extract_entities(text):
     for ent in doc.ents:
         if ent.label_ in target_labels:
             entities.append(ent.text)
-            
+    
+    # Tách các thực thể ghép
+    entities = split_combined_entities(entities)
+    
     # Xóa trùng lặp và trả về định dạng chuỗi của list
     return str(list(set(entities)))
 
