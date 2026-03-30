@@ -17,9 +17,9 @@ MODEL_NAME = 'all-MiniLM-L6-v2'
 
 # THE SPEED LIMITER: Reduced to 3 to avoid Wikipedia rate limiting
 # Wikipedia blocks around 10 concurrent requests, so 3 is safe
-MAX_WORKERS = 15
-RETRY_ATTEMPTS = 2
-BACKOFF_FACTOR = 1  # seconds to wait between retries
+MAX_WORKERS = 3
+RETRY_ATTEMPTS = 3
+BACKOFF_FACTOR = 2  # seconds to wait between retries
 # ===================================================
 
 def parse_entities(entities_str: str) -> List[str]:
