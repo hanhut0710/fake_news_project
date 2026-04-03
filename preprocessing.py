@@ -41,8 +41,10 @@ def extract_entities(text):
     # Tách các thực thể ghép
     entities = split_combined_entities(entities)
     
-    # Xóa trùng lặp và trả về định dạng chuỗi của list
-    return str(list(set(entities)))
+    # Xóa trùng lặp và trả về danh sách (không phải chuỗi) giữ thứ tự xuất hiện
+    # Trả về list để các hàm gọi phía trên có thể xử lý trực tiếp mà không bị
+    # set trên chuỗi gây ra tách ký tự lạ (ví dụ '[' , "'", 'a', ...)
+    return list(dict.fromkeys(entities))
 
 def process_fakenews_file(file_path, source_name, label_value):
     # Đọc và xử lý một file dữ liệu đơn lẻ
@@ -101,7 +103,7 @@ if __name__ == "__main__":
         final_dataset = pd.concat(processed_dfs, ignore_index=True)
         
         # Lưu ra file CSV cuối cùng
-        output_file = "processed_fakenews_data.csv"
+        output_file = "data/processed/processed_fakenews_data.csv"
         final_dataset.to_csv(output_file, index=False)
         print(f"\nHoàn thành! Đã lưu file tại: {output_file}")
 

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Fake News Detection</title>
+    <style>
+        body {
+            font-family: "Segoe UI", Roboto, sans-serif;
+            background-color: #f5f7fa;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.08);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: gray;
+            margin-bottom: 30px;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            resize: none;
+        }
+
+        button {
+            margin-top: 15px;
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        .result-box {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 10px;
+            background: #f9fafc;
+            border-left: 6px solid #ddd;
+        }
+
+        .label {
+            font-size: 18px;
+            font-weight: bold;
+            padding: 6px 12px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+
+        .supports {
+            background: #e6f4ea;
+            color: #2e7d32;
+        }
+
+        .refutes {
+            background: #fdecea;
+            color: #c62828;
+        }
+
+        .nei {
+            background: #fff8e1;
+            color: #f9a825;
+        }
+
+        .section {
+            margin-top: 15px;
+        }
+
+        .section-title {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .evidence {
+            background: #ffffff;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #eee;
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 14px;
+        }
+
+        .confidence {
+            font-size: 14px;
+            color: gray;
+        }
+    </style>
+    </style>
+
+</head>
+
+<body>
+    <form method="POST"> <textarea name="claim" rows="4" placeholder="Enter a claim..."></textarea> <button
+            type="submit">Verify Claim</button> </form> {% if result %} <div class="result-box">
+        <div class="section">
+            <div class="section-title">Claim</div>
+            <div>{{ result.claim }}</div>
+        </div>
+        <div class="section">
+            <div class="section-title">Final Verdict</div> {% if result.final_label == "SUPPORTS" %} <span
+                class="label supports">SUPPORTS</span> {% elif result.final_label == "REFUTES" %} <span
+                class="label refutes">REFUTES</span> {% else %} <span class="label nei">NOT ENOUGH INFO</span> {% endif
+            %} <div class="confidence"> Confidence: {{ result.confidence }} </div>
+        </div>
+        <div class="section">
+            <div class="section-title">Model Prediction</div>
+            <div>{{ result.model_label }}</div>
+        </div>
+        <div class="section">
+            <div class="section-title">Evidence</div>
+            <div class="evidence"> {{ result.evidence }} </div>
+        </div>
+        <div class="section">
+            <div class="section-title">Reasoning</div>
+            <div>{{ result.reason }}</div>
+        </div>
+    </div> {% endif %}
+</body>
+
+</html>

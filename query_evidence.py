@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer, util
 from typing import List
 import concurrent.futures
 from tqdm import tqdm
+from preprocessing import extract_entities
 
 # ====================== CONFIG ======================
 INPUT_CSV = "processed_fakenews_data.csv"
@@ -50,8 +51,36 @@ def is_valid_entity(e):
     )
     
 def split_sentences(text: str) -> List[str]:
+    # Better sentence splitter: keep sentences that contain some informative length
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if len(s.strip()) > 15]
+    cleaned = [s.strip() for s in sentences if len(s.strip()) > 15]
+    return cleaned
+
+
+def clean_text(text: str) -> str:
+    # Remove wiki-style headings and weird artifacts, truncate long repeated sections
+    if not isinstance(text, str):
+        return ""
+    # remove section headers like == Early life ==
+    text = re.sub(r'=+\s*[^=]+\s*=+', ' ', text)
+    # replace pipeline separators used elsewhere
+    text = text.replace('|||', '. ')
+    # remove multiple newlines and weird unicode
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def extract_ordinals(text: str) -> List[int]:
+    # Find ordinals like 45th, 1st, 2nd, 3rd etc.
+    nums = []
+    if not isinstance(text, str):
+        return nums
+    for m in re.findall(r"(\d+)(?:st|nd|rd|th)\b", text, flags=re.IGNORECASE):
+        try:
+            nums.append(int(m))
+        except:
+            pass
+    return nums
 
 def fetch_and_evaluate(row_data):
     """This function is run by multiple workers simultaneously"""
@@ -68,7 +97,8 @@ def fetch_and_evaluate(row_data):
                 results = wikipedia.search(entity, results=1)
                 if results:
                     page = wikipedia.page(results[0], auto_suggest=False)
-                documents.append(page.content[:5000])  # Cap at 5000 chars to save memory
+                # Clean and cap content
+                documents.append(clean_text(page.content)[:5000])  # Cap at 5000 chars to save memory
                 break  # Success, move to next entity
             except wikipedia.exceptions.DisambiguationError as e:
                 # Pick the first option from disambiguation
@@ -101,7 +131,7 @@ def fetch_and_evaluate(row_data):
                     try:
                         time.sleep(0.5)
                         page = wikipedia.page(title, auto_suggest=True)
-                        documents.append(page.content[:5000])
+                        documents.append(clean_text(page.content)[:5000])
                         break  # Got one document, stop searching
                     except Exception:
                         pass
@@ -119,22 +149,75 @@ def fetch_and_evaluate(row_data):
     full_text = " ".join(documents)
     corpus = split_sentences(full_text)[:200]  # Cap sentences for GPU speed
 
-    if len(corpus) == 0:
-        return idx, "No evidence found from Wikipedia."
+    # Basic relevance filter: keep sentences that share tokens with claim or contain entity
+    claim_tokens = set([w.lower() for w in re.findall(r'\w+', claim)][:12])
+    filtered = []
+    for s in corpus:
+        s_low = s.lower()
+        if any(tok in s_low for tok in claim_tokens) or any(e.lower() in s_low for e in entities):
+            filtered.append(s)
+
+    if len(filtered) == 0:
+        # fallback to using original corpus
+        filtered = corpus
 
     # 2. GPU Semantic Search (Compute Bound)
-    corpus_embeddings = model.encode(corpus, convert_to_tensor=True)
+    corpus_embeddings = model.encode(filtered, convert_to_tensor=True)
     query_embedding = model.encode(claim, convert_to_tensor=True)
 
-    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
+    cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].cpu()
+
+    # Boost sentences that contain ordinals or years matching the claim
+    claim_ord = extract_ordinals(claim)
+    year_match = re.findall(r"\b(18|19|20)\d{2}\b", claim)
+
+    adjusted_scores = cosine_scores.numpy().tolist()
+    for i, s in enumerate(filtered):
+        boost = 0.0
+        s_ord = extract_ordinals(s)
+        # exact ordinal match -> boost
+        if any(o in s_ord for o in claim_ord):
+            boost += 0.25
+        # year presence
+        if year_match and any(ym in s for ym in year_match):
+            boost += 0.15
+        # entity exact match
+        if any(e.lower() in s.lower() for e in entities):
+            boost += 0.10
+        adjusted_scores[i] += boost
+
+    top_k = min(TOP_K_EVIDENCE, len(filtered))
+    top_idx = sorted(range(len(adjusted_scores)), key=lambda i: adjusted_scores[i], reverse=True)[:top_k]
+    top_evidence = [filtered[i] for i in top_idx]
+
+    # Clean and truncate each evidence sentence to reduce noise
+    cleaned = []
+    for t in top_evidence:
+        t2 = clean_text(t)
+        if len(t2) > 700:
+            t2 = t2[:700].rsplit(' ', 1)[0] + '...'
+        cleaned.append(t2)
+
+    return idx, " ||| ".join(cleaned)
+
+
+def query_evidence(claim, model):
+    """This is the function that app.py will call"""
+    # For simplicity, we'll just run the fetch_and_evaluate logic for a single claim
+    # In a real implementation, you might want to cache results or handle this differently
     
-    top_k = min(TOP_K_EVIDENCE, len(corpus))
-    top_results = torch.topk(cosine_scores, k=top_k)
+    entities = extract_entities(claim)
+    entities = list(set(entities))[:3]  # Limit to top 3 entities
+
+    print("Extracted entities:", entities)
+
+    # Dummy row data for single claim (no entities)
+    row_data = (0, claim, entities, model)
     
-    top_indices = top_results.indices.tolist()
-    top_evidence = [corpus[i] for i in top_indices]
-    
-    return idx, " ||| ".join(top_evidence)
+    print("Row data:", row_data)
+    _, evidence_str = fetch_and_evaluate(row_data)
+    return evidence_str
+
 
 # ====================== MAIN ======================
 if __name__ == "__main__":
