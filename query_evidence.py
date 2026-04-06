@@ -19,9 +19,14 @@ MODEL_NAME = 'all-MiniLM-L6-v2'
 # THE SPEED LIMITER: Reduced to 3 to avoid Wikipedia rate limiting
 # Wikipedia blocks around 10 concurrent requests, so 3 is safe
 MAX_WORKERS = 3
-RETRY_ATTEMPTS = 3
-BACKOFF_FACTOR = 2  # seconds to wait between retries
+RETRY_ATTEMPTS = 2
+BACKOFF_FACTOR = 1  # seconds to wait between retries
 # ===================================================
+
+# Lightweight in-process cache to avoid re-querying Wikipedia repeatedly
+_EVIDENCE_CACHE = {}
+
+# Device and shared retriever model (instantiate once)
 
 def parse_entities(entities_str: str) -> List[str]:
     if not entities_str or pd.isna(entities_str) or str(entities_str).strip() in ["[]", ""]:
@@ -92,21 +97,20 @@ def fetch_and_evaluate(row_data):
     for entity in entities:
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                # Increased sleep between requests to reduce rate limiting
-                time.sleep(0.5)
+                # polite small delay to avoid aggressive scraping
+                time.sleep(0.2)
                 results = wikipedia.search(entity, results=1)
                 if results:
                     page = wikipedia.page(results[0], auto_suggest=False)
                 # Clean and cap content
-                documents.append(clean_text(page.content)[:5000])  # Cap at 5000 chars to save memory
+                documents.append(clean_text(page.content)[:2000])  # Cap at 2000 chars to save memory
                 break  # Success, move to next entity
             except wikipedia.exceptions.DisambiguationError as e:
                 # Pick the first option from disambiguation
                 try:
-                    time.sleep(0.5)
                     first_option = e.options[0] if e.options else entity
                     page = wikipedia.page(first_option, auto_suggest=False)
-                    documents.append(page.content[:5000])
+                    documents.append(clean_text(page.content)[:2000])
                     break
                 except Exception as e2:
                     if attempt == RETRY_ATTEMPTS - 1:
@@ -125,13 +129,12 @@ def fetch_and_evaluate(row_data):
     if not documents:
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                time.sleep(0.5)
-                search_results = wikipedia.search(claim, results=3)
+                time.sleep(0.2)
+                search_results = wikipedia.search(claim, results=2)
                 for title in search_results:
                     try:
-                        time.sleep(0.5)
                         page = wikipedia.page(title, auto_suggest=True)
-                        documents.append(clean_text(page.content)[:5000])
+                        documents.append(clean_text(page.content)[:2000])
                         break  # Got one document, stop searching
                     except Exception:
                         pass
@@ -147,7 +150,7 @@ def fetch_and_evaluate(row_data):
         return idx, "No evidence found from Wikipedia."
 
     full_text = " ".join(documents)
-    corpus = split_sentences(full_text)[:200]  # Cap sentences for GPU speed
+    corpus = split_sentences(full_text)[:100]  # Cap sentences for speed
 
     # Basic relevance filter: keep sentences that share tokens with claim or contain entity
     claim_tokens = set([w.lower() for w in re.findall(r'\w+', claim)][:12])
@@ -161,9 +164,10 @@ def fetch_and_evaluate(row_data):
         # fallback to using original corpus
         filtered = corpus
 
-    # 2. GPU Semantic Search (Compute Bound)
-    corpus_embeddings = model.encode(filtered, convert_to_tensor=True)
-    query_embedding = model.encode(claim, convert_to_tensor=True)
+    # 2. Semantic Search (Compute Bound)
+    # Use the model instance passed in the row_data tuple (parameter name: model)
+    corpus_embeddings = model.encode(filtered, convert_to_tensor=True, show_progress_bar=False)
+    query_embedding = model.encode(claim, convert_to_tensor=True, show_progress_bar=False)
 
     cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].cpu()
 
@@ -190,7 +194,7 @@ def fetch_and_evaluate(row_data):
     top_idx = sorted(range(len(adjusted_scores)), key=lambda i: adjusted_scores[i], reverse=True)[:top_k]
     top_evidence = [filtered[i] for i in top_idx]
 
-    # Clean and truncate each evidence sentence to reduce noise
+        # Clean and truncate each evidence sentence to reduce noise
     cleaned = []
     for t in top_evidence:
         t2 = clean_text(t)
@@ -201,35 +205,35 @@ def fetch_and_evaluate(row_data):
     return idx, " ||| ".join(cleaned)
 
 
-def query_evidence(claim, model):
-    """This is the function that app.py will call"""
-    # For simplicity, we'll just run the fetch_and_evaluate logic for a single claim
-    # In a real implementation, you might want to cache results or handle this differently
-    
-    entities = extract_entities(claim)
-    entities = list(set(entities))[:3]  # Limit to top 3 entities
+def query_evidence(claim, retriever_model, nlp):
+
+    if claim in _EVIDENCE_CACHE:
+        return _EVIDENCE_CACHE[claim]
+
+    entities = extract_entities(claim, nlp)
+    entities = list(dict.fromkeys(entities))[:3]  # Limit to top 3 unique entities
 
     print("Extracted entities:", entities)
 
-    # Dummy row data for single claim (no entities)
-    row_data = (0, claim, entities, model)
-    
+    row_data = (0, claim, entities, retriever_model)
+
     print("Row data:", row_data)
     _, evidence_str = fetch_and_evaluate(row_data)
+
+    _EVIDENCE_CACHE[claim] = evidence_str
     return evidence_str
 
 
 # ====================== MAIN ======================
 if __name__ == "__main__":
-    if torch.cuda.is_available():
-        device = "cuda"
+    # Instantiate a local retriever model for script mode
+    retriever_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if retriever_device == "cuda":
         gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
-        print(f"🚀 Initializing model on GPU: {gpu_name}")
+        print(f"🚀 Using GPU for retrieval model: {gpu_name}")
     else:
-        device = "cpu"
-        print("⚠️ No GPU detected. Using CPU.")
-    
-    retriever_model = SentenceTransformer(MODEL_NAME, device=device)
+        print("⚠️ No GPU detected. Retrieval will use CPU.")
+    retriever_model = SentenceTransformer(MODEL_NAME, device=retriever_device)
 
     print("📂 Loading data...")
     df = pd.read_csv(INPUT_CSV)

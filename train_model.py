@@ -14,6 +14,10 @@ df_train["label"] = df_train["label"].map(label_map)
 df_test["label"] = df_test["label"].map(label_map)
 df_val["label"] = df_val["label"].map(label_map)
 
+df_train.to_csv("data/split/train.csv", index=False)
+df_val.to_csv("data/split/val.csv", index=False)
+df_test.to_csv("data/split/test.csv", index=False)
+
 train_dataset = Dataset.from_pandas(df_train[["claim", "evidence", "label"]])
 val_dataset = Dataset.from_pandas(df_val[["claim", "evidence", "label"]])
 test_dataset = Dataset.from_pandas(df_test[["claim", "evidence", "label"]])
@@ -69,5 +73,5 @@ metric = trainer.evaluate(test_dataset)
 df_metric = pd.DataFrame([metric])
 df_metric.to_csv("model/test_metrics.csv", index=False)
 
-model.save_pretrained("model_evidence_claim/")
-tokenizer.save_pretrained("model_evidence_claim/")
+model.save_pretrained("model/")
+tokenizer.save_pretrained("model/")

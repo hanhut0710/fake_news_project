@@ -4,8 +4,8 @@ import re
 import ast
 
 # 1. Load mô hình ngôn ngữ của spaCy
-print("Đang tải mô hình spaCy...")
-nlp = spacy.load("en_core_web_sm")
+# print("Đang tải mô hình spaCy...")
+# nlp = spacy.load("en_core_web_sm")
 
 def split_combined_entities(entities_list):
     """
@@ -24,7 +24,7 @@ def split_combined_entities(entities_list):
     
     return split_entities
 
-def extract_entities(text):
+def extract_entities(text, nlp):
     if not isinstance(text, str):
         return "[]"
     

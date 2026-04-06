@@ -10,10 +10,10 @@ labels_map = {
 }
 
 def predict(claim, evidence, model, tokenizer):
-    text = claim + " [SEP] " + evidence
-
+    # Tokenize as a pair to match training (claim, evidence)
     inputs = tokenizer(
-        text,
+        claim,
+        evidence,
         return_tensors="pt",
         truncation=True,
         padding=True,
