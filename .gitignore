@@ -1,2 +1,5 @@
 /model
 /model_evidence_claim
+/__pycache__
+*.pyc
+*.pyo

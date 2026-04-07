@@ -166,7 +166,7 @@ def apply_reasoning(claim, evidence, ml_label, confidence):
     # =========================
     # CASE 4: ML confidence check
     # =========================
-    if confidence < 0.6:
+    if confidence < 0.7:
         return "NOT ENOUGH INFO", "Low model confidence"
 
     if claim.lower() in evidence.lower():

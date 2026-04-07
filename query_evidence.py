@@ -1,5 +1,6 @@
 import pandas as pd
 import wikipedia
+import requests
 import re
 import time
 import torch
@@ -21,11 +22,13 @@ MODEL_NAME = 'all-MiniLM-L6-v2'
 MAX_WORKERS = 3
 RETRY_ATTEMPTS = 2
 BACKOFF_FACTOR = 1  # seconds to wait between retries
+REQUESTS_TIMEOUT = 6  # seconds timeout for HTTP requests to MediaWiki API
 # ===================================================
 
 # Lightweight in-process cache to avoid re-querying Wikipedia repeatedly
 _EVIDENCE_CACHE = {}
 
+_TIMINGS = {}
 # Device and shared retriever model (instantiate once)
 
 def parse_entities(entities_str: str) -> List[str]:
@@ -93,60 +96,99 @@ def fetch_and_evaluate(row_data):
     documents = []
     wikipedia.set_lang(WIKI_LANGUAGE)
 
-    # 1. Ping Wikipedia (Network Bound) - Try each entity individually
+    # timing buckets
+    total_start = time.perf_counter()
+    network_time = 0.0
+    encode_time = 0.0
+
+    # 1. Ping Wikipedia (Network Bound) - Try each entity individually via MediaWiki API with timeout
+    session = requests.Session()
+    session.headers.update({"User-Agent": "fake-news-retriever/1.0 (contact@example.com)"})
+
+    def mw_search_and_extract(q: str):
+        """Search for q and return a short extract (or None).
+
+        Uses opensearch then extracts intro via prop=extracts. Returns text or None.
+        """
+        try:
+            # 1) opensearch for a title
+            sparams = {"action": "opensearch", "search": q, "limit": 1, "namespace": 0, "format": "json"}
+            r = session.get("https://en.wikipedia.org/w/api.php", params=sparams, timeout=REQUESTS_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if len(data) >= 2 and data[1]:
+                title = data[1][0]
+            else:
+                return None
+
+            # 2) get extract for the title (intro only, plain text, small number of sentences)
+            eparams = {"action": "query", "prop": "extracts", "explaintext": 1, "exsentences": 3, "titles": title, "format": "json"}
+            r2 = session.get("https://en.wikipedia.org/w/api.php", params=eparams, timeout=REQUESTS_TIMEOUT)
+            r2.raise_for_status()
+            j = r2.json()
+            pages = j.get("query", {}).get("pages", {})
+            for pid, page in pages.items():
+                extract = page.get("extract")
+                if extract:
+                    return extract
+            return None
+        except Exception:
+            return None
+
     for entity in entities:
         for attempt in range(RETRY_ATTEMPTS):
+            net_s = time.perf_counter()
             try:
-                # polite small delay to avoid aggressive scraping
-                time.sleep(0.2)
-                results = wikipedia.search(entity, results=1)
-                if results:
-                    page = wikipedia.page(results[0], auto_suggest=False)
-                # Clean and cap content
-                documents.append(clean_text(page.content)[:2000])  # Cap at 2000 chars to save memory
-                break  # Success, move to next entity
-            except wikipedia.exceptions.DisambiguationError as e:
-                # Pick the first option from disambiguation
-                try:
-                    first_option = e.options[0] if e.options else entity
-                    page = wikipedia.page(first_option, auto_suggest=False)
-                    documents.append(clean_text(page.content)[:2000])
+                time.sleep(0.05)  # shorter polite delay
+                text = mw_search_and_extract(entity)
+                if text:
+                    documents.append(clean_text(text)[:2000])
+                    network_time += time.perf_counter() - net_s
                     break
-                except Exception as e2:
-                    if attempt == RETRY_ATTEMPTS - 1:
-                        pass  # Skip this entity
-            except wikipedia.exceptions.PageError:
-                if attempt == RETRY_ATTEMPTS - 1:
-                    pass  # Entity doesn't exist, skip
-            except Exception as e:
-                # Rate limiting or network error
-                if attempt < RETRY_ATTEMPTS - 1:
-                    time.sleep(BACKOFF_FACTOR * (2 ** attempt))  # Exponential backoff
                 else:
-                    pass  # Give up on this entity
+                    network_time += time.perf_counter() - net_s
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        time.sleep(BACKOFF_FACTOR * (2 ** attempt))
+                    else:
+                        pass
+            except Exception:
+                network_time += time.perf_counter() - net_s
+                if attempt < RETRY_ATTEMPTS - 1:
+                    time.sleep(BACKOFF_FACTOR * (2 ** attempt))
+                else:
+                    pass
 
     # Fallback search if entities fail (search for claim keywords)
     if not documents:
         for attempt in range(RETRY_ATTEMPTS):
+            net_s = time.perf_counter()
             try:
-                time.sleep(0.2)
-                search_results = wikipedia.search(claim, results=2)
-                for title in search_results:
-                    try:
-                        page = wikipedia.page(title, auto_suggest=True)
-                        documents.append(clean_text(page.content)[:2000])
-                        break  # Got one document, stop searching
-                    except Exception:
-                        pass
-                if documents:
+                time.sleep(0.05)
+                text = mw_search_and_extract(claim)
+                if text:
+                    documents.append(clean_text(text)[:2000])
+                    network_time += time.perf_counter() - net_s
                     break
-            except Exception as e:
+                else:
+                    network_time += time.perf_counter() - net_s
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        time.sleep(BACKOFF_FACTOR * (2 ** attempt))
+                    else:
+                        pass
+            except Exception:
+                network_time += time.perf_counter() - net_s
                 if attempt < RETRY_ATTEMPTS - 1:
                     time.sleep(BACKOFF_FACTOR * (2 ** attempt))
                 else:
                     pass
 
     if not documents:
+        # record timings even when no docs found
+        total_time = time.perf_counter() - total_start
+        try:
+            _TIMINGS[idx] = {'network': round(network_time, 4), 'encode': round(encode_time, 4), 'total': round(total_time, 4)}
+        except Exception:
+            pass
         return idx, "No evidence found from Wikipedia."
 
     full_text = " ".join(documents)
@@ -166,8 +208,10 @@ def fetch_and_evaluate(row_data):
 
     # 2. Semantic Search (Compute Bound)
     # Use the model instance passed in the row_data tuple (parameter name: model)
+    enc_s = time.perf_counter()
     corpus_embeddings = model.encode(filtered, convert_to_tensor=True, show_progress_bar=False)
     query_embedding = model.encode(claim, convert_to_tensor=True, show_progress_bar=False)
+    encode_time += time.perf_counter() - enc_s
 
     cosine_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].cpu()
 
@@ -202,7 +246,13 @@ def fetch_and_evaluate(row_data):
             t2 = t2[:700].rsplit(' ', 1)[0] + '...'
         cleaned.append(t2)
 
-    return idx, " ||| ".join(cleaned)
+    evidence = " ||| ".join(cleaned)
+    total_time = time.perf_counter() - total_start
+    try:
+        _TIMINGS[idx] = {'network': round(network_time, 4), 'encode': round(encode_time, 4), 'total': round(total_time, 4)}
+    except Exception:
+        pass
+    return idx, evidence
 
 
 def query_evidence(claim, retriever_model, nlp):
@@ -222,6 +272,33 @@ def query_evidence(claim, retriever_model, nlp):
 
     _EVIDENCE_CACHE[claim] = evidence_str
     return evidence_str
+
+
+def get_timing_summary():
+    """Return a small timing summary (averages and top slow records).
+
+    Returns a dict with keys: 'avg' and 'top' where 'avg' contains
+    average network/encode/total times and 'top' is a list of top5 slow
+    records as (idx, total, network, encode).
+    """
+    if not _TIMINGS:
+        return {}
+    try:
+        total_net = sum(v['network'] for v in _TIMINGS.values())
+        total_enc = sum(v['encode'] for v in _TIMINGS.values())
+        total_tot = sum(v['total'] for v in _TIMINGS.values())
+        n = len(_TIMINGS)
+        avg = {
+            'network': round(total_net / n, 3),
+            'encode': round(total_enc / n, 3),
+            'total': round(total_tot / n, 3),
+            'count': n,
+        }
+        slow = sorted(_TIMINGS.items(), key=lambda kv: kv[1]['total'], reverse=True)[:5]
+        top = [(int(k), float(v['total']), float(v['network']), float(v['encode'])) for k, v in slow]
+        return {'avg': avg, 'top': top}
+    except Exception:
+        return {}
 
 
 # ====================== MAIN ======================

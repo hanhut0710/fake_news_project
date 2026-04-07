@@ -117,8 +117,21 @@
 </head>
 
 <body>
-    <form method="POST"> <textarea name="claim" rows="4" placeholder="Enter a claim..."></textarea> <button
-            type="submit">Verify Claim</button> </form> {% if result %} <div class="result-box">
+    <form method="POST">
+        <textarea name="claim" rows="4" placeholder="Enter a claim..."></textarea>
+        <div style="margin-top:10px; margin-bottom:6px">
+            <label for="mode">Model / Mode:</label>
+            <select id="mode" name="mode">
+                <option value="baseline" {% if mode == 'baseline' %}selected{% endif %}>Baseline (TF-IDF + Logistic)</option>
+                <option value="bert_no_reasoning" {% if mode == 'bert_no_reasoning' %}selected{% endif %}>BERT (claim+evidence) — no reasoning</option>
+                <option value="bert_with_reasoning" {% if mode == 'bert_with_reasoning' %}selected{% endif %}>BERT (claim+evidence) — with reasoning</option>
+            </select>
+        </div>
+        <button type="submit">Verify Claim</button>
+    </form>
+
+    {% if result %}
+    <div class="result-box">
         <div class="section">
             <div class="section-title">Claim</div>
             <div>{{ result.claim }}</div>
@@ -140,6 +153,20 @@
         <div class="section">
             <div class="section-title">Reasoning</div>
             <div>{{ result.reason }}</div>
+        </div>
+        <div class="section">
+            <div class="section-title">Retrieval Timing</div>
+            {% if timings and timings.avg %}
+            <div class="confidence">Avg (network / encode / total): {{ timings.avg.network }}s / {{ timings.avg.encode }}s / {{ timings.avg.total }}s</div>
+            <div style="margin-top:8px; font-size:13px; color:#555">Top slow records:</div>
+            <ul style="font-size:13px; color:#444; margin-top:6px">
+                {% for item in timings.top %}
+                <li>idx {{ item[0] }} — total {{ '%.2f'|format(item[1]) }}s (net {{ '%.2f'|format(item[2]) }}s, enc {{ '%.2f'|format(item[3]) }}s)</li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="confidence">No timing data available.</div>
+            {% endif %}
         </div>
     </div> {% endif %}
 </body>
