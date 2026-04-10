@@ -145,7 +145,7 @@ def evaluate(model_dir: str, test_csv: str, save_csv: str, batch_size: int = 32,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', default='model_evidence_claim/', help='Model directory')
+    parser.add_argument('--model_dir', default='model/model_bert', help='Model directory')
     parser.add_argument('--test_csv', default='data/split/test.csv', help='Test CSV file (claim,evidence,label)')
     parser.add_argument('--save_csv', default='model/test_metrics.csv', help='Where to save metrics summary')
     parser.add_argument('--batch_size', type=int, default=32)

@@ -133,7 +133,7 @@ def apply_reasoning(claim, evidence, ml_label, confidence):
 
     # Nếu claim và evidence phủ định NGƯỢC nhau → conflict
     if claim_neg != evidence_neg:
-        return "NOT ENOUGH INFO", "Negation conflict between claim and evidence"
+        return "REFUTES", "Negation conflict between claim and evidence"
 
     # =========================
     # CASE 3b: Relation contradictions (e.g., orbital relations)
