@@ -1,0 +1,14 @@
+:root{
+  --brand:#0d6efd;
+  --muted:#6c757d;
+}
+body{font-family: Inter, "Segoe UI", Roboto, system-ui, -apple-system, "Helvetica Neue", Arial;}
+.navbar-brand{color:var(--brand) !important}
+.card{border:0}
+.evidence{max-height:220px; overflow:auto; white-space:pre-wrap}
+textarea.form-control{box-shadow:none}
+textarea.form-control:focus{box-shadow:0 0 0 .15rem rgba(13,110,253,.15)}
+footer{background:transparent}
+@media (max-width:576px){
+  .navbar .d-none.d-md-block{display:none !important}
+}
